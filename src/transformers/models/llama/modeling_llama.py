@@ -84,8 +84,8 @@ class LlamaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        # torch.cuda.reset_max_memory_allocated()
-        # print_memory_usage("LlamaRMSNorm_start")
+        torch.cuda.reset_max_memory_allocated()
+        print_memory_usage("LlamaRMSNorm_start")
 
         # memory_usage = 0
         input_dtype = hidden_states.dtype
@@ -121,7 +121,7 @@ class LlamaRMSNorm(nn.Module):
         # print(f"After scaling by weight Theory memory usage: {output_memory / (1024 ** 3)} GB")
         #
         # print(f"Theory memory usage: {memory_usage / (1024 ** 3)} GB")
-        # print_memory_usage("LlamaRMSNorm_end")
+        print_memory_usage("LlamaRMSNorm_end")
 
         return result_states
 
@@ -719,15 +719,15 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Cache] = None,
+            output_attentions: Optional[bool] = False,
+            use_cache: Optional[bool] = False,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -748,13 +748,19 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
+        torch.cuda.reset_max_memory_allocated()
+        print_memory_usage("Model_forward_start")
+
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        # Step 1: Input Layer Norm
+        hidden_states1 = self.input_layernorm(hidden_states)
+        hidden_states.detach()
+        hidden_states = None
 
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
+        # Step 2: Self Attention
+        hidden_states2, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states1,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -762,15 +768,39 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
         )
-        hidden_states = residual + hidden_states
+        hidden_states1.detach()
+        hidden_states1 = None
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states3 = residual + hidden_states2
+        hidden_states2.detach()
+        hidden_states2 = None
+        residual.detach()
+        residual = None
 
-        outputs = (hidden_states,)
+        torch.cuda.empty_cache()
+        print_memory_usage("After_self_attention")
+
+        # Step 3: Post Attention Layer Norm
+        residual = hidden_states3
+        hidden_states4 = self.post_attention_layernorm(hidden_states3)
+        hidden_states3.detach()
+        hidden_states3 = None
+
+        # Step 4: MLP
+        hidden_states5 = self.mlp(hidden_states4)
+        hidden_states4.detach()
+        hidden_states4 = None
+
+        hidden_states6 = residual + hidden_states5
+        hidden_states5.detach()
+        hidden_states5 = None
+        residual.detach()
+        residual = None
+
+        torch.cuda.empty_cache()
+        print_memory_usage("After_MLP")
+
+        outputs = (hidden_states6,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -778,6 +808,7 @@ class LlamaDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
+        print_memory_usage("Model_forward_end")
         return outputs
 
 
