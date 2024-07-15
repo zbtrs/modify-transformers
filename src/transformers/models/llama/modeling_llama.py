@@ -25,6 +25,9 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.image_transforms import normalize
+
+from .utils import print_memory_usage
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
@@ -81,11 +84,46 @@ class LlamaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        # torch.cuda.reset_max_memory_allocated()
+        # print_memory_usage("LlamaRMSNorm_start")
+
+        # memory_usage = 0
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+
+        # Step 1: Convert dtype
+        hidden_states1 = hidden_states.to(torch.float32)
+        hidden_states.detach()
+        hidden_states = None
+        # dtype_converted_memory = hidden_states1.element_size() * hidden_states1.nelement()
+        # memory_usage += dtype_converted_memory
+        # print_memory_usage("After dtype conversion")
+        # print(f"After dtype conversion Theory memory usage: {memory_usage / (1024 ** 3)} GB")
+
+        # Step 2: Calculate variance
+        variance = hidden_states1.pow(2).mean(-1, keepdim=True)
+        # variance_memory = variance.element_size() * variance.nelement()
+        # memory_usage += variance_memory
+        # print_memory_usage("After variance calculation")
+        # print(f"After variance calculation Theory memory usage: {variance_memory / (1024 ** 3)} GB")
+
+        # Step 3: Normalize
+        hidden_states1 = hidden_states1 * torch.rsqrt(variance + self.variance_epsilon)
+
+
+        # Step 4: Scale by weight
+        result_states = self.weight * hidden_states1.to(input_dtype)
+        hidden_states1.detach()
+        hidden_states1 = None
+        # output_memory = result_states.element_size() * result_states.nelement()
+        # memory_usage += output_memory
+        torch.cuda.empty_cache()
+        # print_memory_usage("After scaling by weight")
+        # print(f"After scaling by weight Theory memory usage: {output_memory / (1024 ** 3)} GB")
+        #
+        # print(f"Theory memory usage: {memory_usage / (1024 ** 3)} GB")
+        # print_memory_usage("LlamaRMSNorm_end")
+
+        return result_states
 
 
 ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
@@ -992,21 +1030,25 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+            layer_outputs = None
 
-        hidden_states = self.norm(hidden_states)
+
+        hidden_states1 = self.norm(hidden_states)
+        hidden_states = None
+        # torch.cuda.empty_cache()
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states += (hidden_states1,)
 
         next_cache = next_decoder_cache if use_cache else None
         if return_legacy_cache:
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states1, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+            last_hidden_state=hidden_states1,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
