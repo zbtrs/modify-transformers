@@ -249,38 +249,39 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            with torch.no_grad():
-                up_proj = self.up_proj(x)
-                print(f"up_proj memory: {up_proj.element_size() * up_proj.nelement() / (1024 ** 3)} GB")
+            up_proj = self.up_proj(x)
+            # print(f"up_proj memory: {up_proj.element_size() * up_proj.nelement() / (1024 ** 3)} GB")
 
-                gate_proj = self.gate_proj(x)
-                print(f"gate_proj memory: {gate_proj.element_size() * gate_proj.nelement() / (1024 ** 3)} GB")
-                print_memory_usage('sb1')
-                x.detach()
-                x = None
-                torch.cuda.empty_cache()
-                print_memory_usage('sb2')
+            gate_proj = self.gate_proj(x)
+            # print(f"gate_proj memory: {gate_proj.element_size() * gate_proj.nelement() / (1024 ** 3)} GB")
+            # print_memory_usage('sb1')
+            x.detach()
+            x = None
+            torch.cuda.empty_cache()
+            # print_memory_usage('sb2')
 
-                act_fn = self.act_fn(gate_proj)
-                print(f"act_fn memory: {act_fn.element_size() * act_fn.nelement() / (1024 ** 3)} GB")
-                print_memory_usage('sb3')
-                gate_proj.detach()
-                gate_proj = None
-                torch.cuda.empty_cache()
-                print_memory_usage('sb4')
-                mul = act_fn * up_proj
-                print(f"mul memory: {mul.element_size() * mul.nelement() / (1024 ** 3)} GB")
-                print_memory_usage('sb5')
-                act_fn.detach()
-                act_fn = None
-                up_proj.detach()
-                up_proj = None
-                torch.cuda.empty_cache()
-                print_memory_usage('sb6')
-                down_proj = self.down_proj(mul)
-                print(f"down_proj memory: {down_proj.element_size() * down_proj.nelement() / (1024 ** 3)} GB")
-                mul.detach()
-                mul = None
+            act_fn = self.act_fn(gate_proj)
+            # print(f"act_fn memory: {act_fn.element_size() * act_fn.nelement() / (1024 ** 3)} GB")
+            # print_memory_usage('sb3')
+            gate_proj.detach()
+            gate_proj = None
+            torch.cuda.empty_cache()
+            # print_memory_usage('sb4')
+            mul = act_fn * up_proj
+            print(f"mul memory: {mul.element_size() * mul.nelement() / (1024 ** 3)} GB")
+            # print_memory_usage('sb5')
+            act_fn.detach()
+            act_fn = None
+            up_proj.detach()
+            up_proj = None
+            torch.cuda.empty_cache()
+            # print_memory_usage('sb6')
+            down_proj = self.down_proj(mul)
+            # print(f"down_proj memory: {down_proj.element_size() * down_proj.nelement() / (1024 ** 3)} GB")
+            mul.detach()
+            mul = None
+            torch.cuda.empty_cache()
+
 
         return down_proj
 
@@ -676,45 +677,61 @@ class LlamaSdpaAttention(LlamaAttention):
                 use_cache=use_cache,
                 cache_position=cache_position,
             )
-        print_memory_usage("attention start")
+        # print_memory_usage("attention start")
         bsz, q_len, _ = hidden_states.size()
 
+        print_memory_usage('att1')
         query_states1 = self.q_proj(hidden_states)
         key_states1 = self.k_proj(hidden_states)
         value_states1 = self.v_proj(hidden_states)
+        print_memory_usage('att2')
         hidden_states.detach()
         hidden_states = None
-
+        print_memory_usage('att3')
         query_states2 = query_states1.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states2 = key_states1.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states2 = value_states1.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        print_memory_usage('att4')
         query_states1.detach()
         key_states1.detach()
         value_states1.detach()
         query_states1 = None
         key_states1 = None
         value_states1 = None
-
+        torch.cuda.empty_cache()
+        print_memory_usage('att5')
         cos, sin = self.rotary_emb(value_states2, position_ids)
+        print_memory_usage('att6')
         query_states3, key_states3 = apply_rotary_pos_emb(query_states2, key_states2, cos, sin)
+        print_memory_usage('att7')
         query_states2.detach()
         key_states2.detach()
         query_states2 = None
         key_states2 = None
+        torch.cuda.empty_cache()
+        print_memory_usage('att8')
+
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states3, value_states2 = past_key_value.update(key_states3, value_states2, self.layer_idx, cache_kwargs)
+        print_memory_usage('att9')
 
         key_states5 = repeat_kv(key_states3, self.num_key_value_groups)
         value_states4 = repeat_kv(value_states2, self.num_key_value_groups)
+        print_memory_usage('att10')
+
         key_states3.detach()
         value_states2.detach()
         key_states3 = None
         value_states2 = None
+        torch.cuda.empty_cache()
+        print_memory_usage('att11')
 
         causal_mask = attention_mask
+        print_memory_usage('att12')
+
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states5.shape[-2]]
 
@@ -722,6 +739,7 @@ class LlamaSdpaAttention(LlamaAttention):
             query_states3 = query_states3.contiguous()
             key_states5 = key_states5.contiguous()
             value_states4 = value_states4.contiguous()
+        print_memory_usage('att13')
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
@@ -735,21 +753,32 @@ class LlamaSdpaAttention(LlamaAttention):
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
+        print_memory_usage('att14')
 
         attn_output2 = attn_output1.transpose(1, 2).contiguous()
+        print_memory_usage('att15')
+
         attn_output1.detach()
         attn_output1 = None
+        print_memory_usage('att16')
 
         attn_output3 = attn_output2.view(bsz, q_len, -1)
+        print_memory_usage('att17')
+
         attn_output2.detach()
         attn_output2 = None
+        print_memory_usage('att18')
 
         attn_output4 = self.o_proj(attn_output3)
+        print_memory_usage('att19')
+
         attn_output3.detach()
         attn_output3 = None
         torch.cuda.empty_cache()
+        print_memory_usage('att20')
 
-        print_memory_usage("attention end")
+
+        # print_memory_usage("attention end")
         return attn_output4, None, past_key_value
 
 LLAMA_ATTENTION_CLASSES = {
@@ -800,7 +829,7 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
-        print_memory_usage("Decoder layer start")
+        # print_memory_usage("Decoder layer start")
 
         residual = hidden_states
 
@@ -815,6 +844,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = None
 
         # Step 2: Self Attention
+        print_memory_usage('before attn')
         hidden_states2, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states1,
             attention_mask=attention_mask,
@@ -828,43 +858,57 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states1 = None
 
         torch.cuda.empty_cache()
-        print_memory_usage("tag1")
+        print_memory_usage("after attn")
         hidden_states3 = residual + hidden_states2
+        # print_memory_usage('tag1')
+        # print(f"{(hidden_states2.nelement() * hidden_states2.element_size()) / (1024 ** 3)}")
+        # print(f"{(residual.nelement() * residual.element_size()) / (1024 ** 3)}")
+
         hidden_states2.detach()
         hidden_states2 = None
+        torch.cuda.empty_cache()
+        # print_memory_usage('tag3')
         residual.detach()
         residual = None
         torch.cuda.empty_cache()
-        print_memory_usage("tag2")
+        # print_memory_usage("tag2")
         hidden_states3_memory = hidden_states3.element_size() * hidden_states3.nelement()
-        print(f"layernorm output memory: {hidden_states3_memory / (1024 ** 3)} GB")
+        # print(f"layernorm output memory: {hidden_states3_memory / (1024 ** 3)} GB")
 
         # Step 3: Post Attention Layer Norm
         residual = hidden_states3
         hidden_states4 = self.post_attention_layernorm(hidden_states3)
+        print_memory_usage("tag4")
         hidden_states3.detach()
         hidden_states3 = None
         torch.cuda.empty_cache()
         print_memory_usage("tag3")
         # Step 4: MLP
         hidden_states5 = self.mlp(hidden_states4)
+        # print_memory_usage('tag1')
+        print(f"{hidden_states4.nelement() * hidden_states4.element_size() / (1024 ** 3)}")
         hidden_states4.detach()
         hidden_states4 = None
         torch.cuda.empty_cache()
-        print_memory_usage("tag4")
+        print_memory_usage('tag2')
+        # print_memory_usage("tag4")
 
         hidden_states6 = residual + hidden_states5
-        print_memory_usage("tag7")
+        # print_memory_usage("tag7")
+        # print(f"{(hidden_states5.nelement() * hidden_states5.element_size() + residual.nelement() * residual.element_size()) / (1024 ** 3)}")
+
         hidden_states5.detach()
         hidden_states5 = None
+        print_memory_usage('tag100')
         residual.detach()
         residual = None
         torch.cuda.empty_cache()
-        print_memory_usage("tag5")
+        print_memory_usage('tag200')
+        # print_memory_usage("tag5")
 
 
         hidden_states6_memory = hidden_states6.element_size() * hidden_states6.nelement()
-        print(f"layernorm output memory: {hidden_states6_memory / (1024 ** 3)} GB")
+        # print(f"layernorm output memory: {hidden_states6_memory / (1024 ** 3)} GB")
         outputs = (hidden_states6,)
 
         if output_attentions:
@@ -873,7 +917,7 @@ class LlamaDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        print_memory_usage("Decoder Layer end")
+        # print_memory_usage("Decoder Layer end")
         return outputs
 
 
