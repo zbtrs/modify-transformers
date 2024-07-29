@@ -877,6 +877,8 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
+        self.forward_states = []
+        self.end_states = []
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -947,7 +949,13 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
+        self.forward_states.clear()
+        self.end_states.clear()
+
+        decoder_count = 0
+
         for decoder_layer in self.layers:
+            decoder_count += 1
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -974,6 +982,10 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            # if decoder_count == len(self.layers) // 2:
+            # self.end_states.append(hidden_states)
+            # hidden_states = hidden_states.detach().clone().requires_grad_(True)
+            # self.forward_states.append(hidden_states)
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
