@@ -1018,11 +1018,8 @@ class LlamaModel(LlamaPreTrainedModel):
             )
         elif is_pipeline is True and layer_number == 0:
             self.output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-            output_hidden_states = (
-                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-            )
             self.use_cache = use_cache if use_cache is not None else self.config.use_cache
-            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+            self.return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError(
@@ -1039,8 +1036,10 @@ class LlamaModel(LlamaPreTrainedModel):
                 inputs_embeds = self.embed_tokens(input_ids)
 
             self.past_key_values = past_key_values
+            self.return_legacy_cache = False
 
             if self.use_cache and not isinstance(self.past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
+                self.return_legacy_cache = True
                 self.past_key_values = DynamicCache.from_legacy_cache(self.past_key_values)
 
             self.cache_position = cache_position
@@ -1054,10 +1053,10 @@ class LlamaModel(LlamaPreTrainedModel):
             self.position_ids = position_ids
 
             if self.position_ids is None:
-                self.position_ids = cache_position.unsqueeze(0)
+                self.position_ids = self.cache_position.unsqueeze(0)
 
             self.causal_mask = self._update_causal_mask(
-                attention_mask, inputs_embeds, cache_position, self.past_key_values, output_attentions
+                attention_mask, inputs_embeds, self.cache_position, self.past_key_values, output_attentions
             )
 
             # embed positions
@@ -1115,13 +1114,21 @@ class LlamaModel(LlamaPreTrainedModel):
             self.end_states.append(hidden_states)
             hidden_states = hidden_states.detach().clone().requires_grad_(True)
             self.forward_states.append(hidden_states)
+
+            if self.use_cache:
+                next_decoder_cache = layer_outputs[2 if self.output_attentions else 1]
+
             hidden_states = self.norm(hidden_states)
 
+            next_cache = next_decoder_cache if self.use_cache else None
+            if self.return_legacy_cache:
+                next_cache = next_cache.to_legacy_cache()
+
             if not return_dict:
-                return tuple(hidden_states)
+                return tuple(v for v in [hidden_states, next_cache] if v is not None)
             return BaseModelOutputWithPast(
                 last_hidden_state=hidden_states,
-                past_key_values=None,
+                past_key_values=next_cache,
                 hidden_states=None,
                 attentions=None,
             )
