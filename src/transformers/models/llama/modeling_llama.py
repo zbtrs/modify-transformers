@@ -902,115 +902,230 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        is_pipeline: Optional[bool] = None,
+        layer_number: Optional[int] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast, torch.Tensor]:
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+        if is_pipeline is not None and is_pipeline is False:
+            output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
+            use_cache = use_cache if use_cache is not None else self.config.use_cache
+            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
+
+            if self.gradient_checkpointing and self.training and use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+                )
+                use_cache = False
+
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            return_legacy_cache = False
+            if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
+                return_legacy_cache = True
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
             )
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            use_cache = False
+            # embed positions
+            hidden_states = inputs_embeds
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            # decoder layers
+            all_hidden_states = () if output_hidden_states else None
+            all_self_attns = () if output_attentions else None
+            next_decoder_cache = None
 
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
-            return_legacy_cache = True
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            self.forward_states.clear()
+            self.end_states.clear()
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            decoder_count = 0
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+            for decoder_layer in self.layers:
+                decoder_count += 1
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-        # embed positions
-        hidden_states = inputs_embeds
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
 
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
+                hidden_states = layer_outputs[0]
+                # if decoder_count == len(self.layers) // 2:
+                # self.end_states.append(hidden_states)
+                # hidden_states = hidden_states.detach().clone().requires_grad_(True)
+                # self.forward_states.append(hidden_states)
 
-        self.forward_states.clear()
-        self.end_states.clear()
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
-        decoder_count = 0
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
 
-        for decoder_layer in self.layers:
-            decoder_count += 1
+            hidden_states = self.norm(hidden_states)
+
+            # add hidden states from the last decoder layer
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
+            next_cache = next_decoder_cache if use_cache else None
+            if return_legacy_cache:
+                next_cache = next_cache.to_legacy_cache()
+
+            if not return_dict:
+                return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+            )
+        elif is_pipeline is True and layer_number == 0:
+            self.output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
+            self.use_cache = use_cache if use_cache is not None else self.config.use_cache
+            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
                 )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
+
+            if self.gradient_checkpointing and self.training and self.use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
                 )
+                self.use_cache = False
+
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            self.past_key_values = past_key_values
+
+            if self.use_cache and not isinstance(self.past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
+                self.past_key_values = DynamicCache.from_legacy_cache(self.past_key_values)
+
+            self.cache_position = cache_position
+
+            if self.cache_position is None:
+                past_seen_tokens = self.past_key_values.get_seq_length() if self.past_key_values is not None else 0
+                self.cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+
+            self.position_ids = position_ids
+
+            if self.position_ids is None:
+                self.position_ids = cache_position.unsqueeze(0)
+
+            self.causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, self.past_key_values, output_attentions
+            )
+
+            # embed positions
+            hidden_states = inputs_embeds
+
+            self.forward_states.clear()
+            self.end_states.clear()
+
+            layer_outputs = self.layers[layer_number](
+                hidden_states,
+                attention_mask=self.causal_mask,
+                position_ids=self.position_ids,
+                past_key_value=self.past_key_values,
+                output_attentions=self.output_attentions,
+                use_cache=self.use_cache,
+                cache_position=self.cache_position,
+            )
 
             hidden_states = layer_outputs[0]
-            # if decoder_count == len(self.layers) // 2:
-            # self.end_states.append(hidden_states)
-            # hidden_states = hidden_states.detach().clone().requires_grad_(True)
-            # self.forward_states.append(hidden_states)
+            self.end_states.append(hidden_states)
+            hidden_states = hidden_states.detach().clone().requires_grad_(True)
+            self.forward_states.append(hidden_states)
 
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+            return hidden_states
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+        elif is_pipeline is True and layer_number + 1 < len(self.layers):
+            layer_outputs = self.layers[layer_number](
+                hidden_states,
+                attention_mask=self.causal_mask,
+                position_ids=self.position_ids,
+                past_key_value=self.past_key_values,
+                output_attentions=self.output_attentions,
+                use_cache=self.use_cache,
+                cache_position=self.cache_position,
+            )
 
-        hidden_states = self.norm(hidden_states)
+            hidden_states = layer_outputs[0]
+            self.end_states.append(hidden_states)
+            hidden_states = hidden_states.detach().clone().requires_grad_(True)
+            self.forward_states.append(hidden_states)
 
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            return hidden_states
+        elif is_pipeline is True and layer_number + 1 == len(self.layers):
+            layer_outputs = self.layers[layer_number](
+                hidden_states,
+                attention_mask=self.causal_mask,
+                position_ids=self.position_ids,
+                past_key_value=self.past_key_values,
+                output_attentions=self.output_attentions,
+                use_cache=self.use_cache,
+                cache_position=self.cache_position,
+            )
 
-        next_cache = next_decoder_cache if use_cache else None
-        if return_legacy_cache:
-            next_cache = next_cache.to_legacy_cache()
+            hidden_states = layer_outputs[0]
+            self.end_states.append(hidden_states)
+            hidden_states = hidden_states.detach().clone().requires_grad_(True)
+            self.forward_states.append(hidden_states)
+            hidden_states = self.norm(hidden_states)
 
-        if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
+            if not return_dict:
+                return tuple(hidden_states)
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+            )
+
 
     def _update_causal_mask(
         self,
@@ -1127,7 +1242,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
@@ -1138,7 +1253,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        is_pipeline: Optional[bool] = None,
+        layer_number: Optional[int] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast, torch.Tensor]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1164,59 +1282,118 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
+        if is_pipeline is not None and is_pipeline is False:
 
-        hidden_states = outputs[0]
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
-        logits = logits.float()
 
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            hidden_states = outputs[0]
+            if self.config.pretraining_tp > 1:
+                lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+                logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+                logits = torch.cat(logits, dim=-1)
+            else:
+                logits = self.lm_head(hidden_states)
+            logits = logits.float()
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+            loss = None
+            if labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
+
+            if not return_dict:
+                output = (logits,) + outputs[1:]
+                return (loss,) + output if loss is not None else output
+
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        elif is_pipeline is True:
+
+            # TODO: check layer_number
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                is_pipeline=is_pipeline,
+                layer_number=layer_number,
+                hidden_states=hidden_states,
+            )
+            if layer_number + 1 < len(self.model.layers):
+                return outputs
+            else:
+                hidden_states1 = outputs[0]
+                if self.config.pretraining_tp > 1:
+                    lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+                    logits = [F.linear(hidden_states1, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+                    logits = torch.cat(logits, dim=-1)
+                else:
+                    logits = self.lm_head(hidden_states1)
+                logits = logits.float()
+
+                loss = None
+                if labels is not None:
+                    # Shift so that tokens < n predict n
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    # Flatten the tokens
+                    loss_fct = CrossEntropyLoss()
+                    shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                    shift_labels = shift_labels.view(-1)
+                    # Enable model parallelism
+                    shift_labels = shift_labels.to(shift_logits.device)
+                    loss = loss_fct(shift_logits, shift_labels)
+
+                if not return_dict:
+                    output = (logits,) + outputs[1:]
+                    return (loss,) + output if loss is not None else output
+
+                return CausalLMOutputWithPast(
+                    loss=loss,
+                    logits=logits,
+                    past_key_values=outputs.past_key_values,
+                    hidden_states=outputs.hidden_states,
+                    attentions=outputs.attentions,
+                )
+
 
     def prepare_inputs_for_generation(
         self,
